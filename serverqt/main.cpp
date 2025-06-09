@@ -47,6 +47,7 @@ typedef struct {
     int file_fd;
 } Client;
 
+//缓冲区
 static char sendbuffer[BUFFER_SIZE];
 static char recvbuffer[BUFFER_SIZE];
 
