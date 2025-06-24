@@ -16,6 +16,7 @@
 #include <map>
 #include <vector>
 #include <string>
+#include <boost/crc.hpp>
 
 // 常量定义
 #define MAX_EVENTS 1024       // epoll最大事件数
@@ -45,6 +46,7 @@ typedef struct {
     uint32_t chunk_index;    // 当前分片序号
     uint32_t chunk_count;    // 总分片数
     uint32_t sender_id;      // 发送者ID
+    uint32_t crc32;          // CRC32校验（新增）
 } __attribute__((packed)) PacketHeader;
 
 // 客户端连接信息结构体
@@ -139,9 +141,25 @@ bool insert_client_with_id(MYSQL* conn, const char* ip, int port, int* client_id
     return true;
 }
 
+// CRC32计算函数
+uint32_t calculateHeaderCRC32(const PacketHeader* header, const void* data, size_t data_len) {
+    boost::crc_32_type crc;
+    // 只对 header 的前 N 字节（不含 crc32 字段）+ data 做校验
+    crc.process_bytes(header, offsetof(PacketHeader, crc32));
+    if (data && data_len > 0) {
+        crc.process_bytes(data, data_len);
+    }
+    return crc.checksum();
+}
+
+// CRC32校验日志辅助函数
+void print_crc32_check(const char* type, uint32_t msg_id, uint32_t crc_recv, uint32_t crc_calc, int chunk_index, int chunk_count, int ok) {
+    printf("[CRC32校验] type:%s msg_id:%u chunk:%d/%d 收到:%08x 计算:%08x 结果:%s\n",
+        type, msg_id, chunk_index, chunk_count, crc_recv, crc_calc, ok ? "成功" : "失败");
+}
+
 // 发送ACK确认消息
 void send_ack(int client_fd, uint32_t msg_id, uint32_t chunk_index) {
-    // 构建ACK头部
     PacketHeader ack_header = {
         .version = MY_PROTOCOL_VERSION,
         .msg_type = MSG_TYPE_ACK,
@@ -151,10 +169,11 @@ void send_ack(int client_fd, uint32_t msg_id, uint32_t chunk_index) {
         .msg_id = htonl(msg_id),
         .chunk_index = htonl(chunk_index),
         .chunk_count = 0,
-        .sender_id = 0
+        .sender_id = 0,
+        .crc32 = 0
     };
-
-    // 发送ACK包
+    // 计算CRC32
+    ack_header.crc32 = htonl(calculateHeaderCRC32(&ack_header, NULL, 0));
     if (send(client_fd, &ack_header, sizeof(ack_header), MSG_NOSIGNAL) == -1) {
         fprintf(stderr, "发送ACK失败: %s\n", strerror(errno));
     }
@@ -173,17 +192,12 @@ std::vector<Client> get_online_clients(Client clients[]) {
 
 // 广播客户端列表给所有在线客户端
 void broadcast_client_list(Client clients[]) {
-    // 获取当前在线客户端
     std::vector<Client> online_clients = get_online_clients(clients);
-
-    // 构建客户端列表数据(格式: ID:IP:Port;)
     std::string client_list_data;
     for (const auto& client : online_clients) {
         client_list_data += std::to_string(client.id) + ":" + client.ip + ":" + std::to_string(client.port) + ";";
     }
-
     if (!client_list_data.empty()) {
-        // 构建协议头
         PacketHeader header = {
             .version = MY_PROTOCOL_VERSION,
             .msg_type = MSG_TYPE_CLIENT_LIST,
@@ -193,18 +207,17 @@ void broadcast_client_list(Client clients[]) {
             .msg_id = htonl(generate_msg_id()),
             .chunk_index = 0,
             .chunk_count = 0,
-            .sender_id = 0
+            .sender_id = 0,
+            .crc32 = 0
         };
-
-        // 向每个在线客户端发送列表
+        // 计算CRC32
+        header.crc32 = htonl(calculateHeaderCRC32(&header, client_list_data.c_str(), client_list_data.length()));
         for (int i = 0; i < MAX_CLIENTS; i++) {
             if (clients[i].socket != -1 && clients[i].is_online) {
-                // 发送协议头
                 if (send(clients[i].socket, &header, sizeof(header), MSG_NOSIGNAL) == -1) {
                     fprintf(stderr, "发送客户端列表失败: %s\n", strerror(errno));
                     continue;
                 }
-                // 发送列表数据
                 if (send(clients[i].socket, client_list_data.c_str(), client_list_data.length(), MSG_NOSIGNAL) == -1) {
                     fprintf(stderr, "发送客户端列表数据失败: %s\n", strerror(errno));
                     continue;
@@ -218,11 +231,8 @@ void broadcast_client_list(Client clients[]) {
 void broadcast_message(Client clients[], int sender_fd, const void* data, size_t len,
     uint8_t msg_type, const char* filename, uint32_t filename_len, uint64_t file_size,
     uint32_t msg_id, uint32_t chunk_index, uint32_t chunk_count, uint32_t sender_id) {
-
-    // 遍历所有客户端
     for (int i = 0; i < MAX_CLIENTS; i++) {
         if (clients[i].socket != -1 && clients[i].is_online) {
-            // 构建协议头
             PacketHeader header = {
                 .version = MY_PROTOCOL_VERSION,
                 .msg_type = msg_type,
@@ -232,32 +242,38 @@ void broadcast_message(Client clients[], int sender_fd, const void* data, size_t
                 .msg_id = htonl(msg_id),
                 .chunk_index = htonl(chunk_index),
                 .chunk_count = htonl(chunk_count),
-                .sender_id = htonl(sender_id)
+                .sender_id = htonl(sender_id),
+                .crc32 = 0
             };
-
-            // 发送协议头
+            // 计算CRC32
+            if (filename_len > 0 && filename) {
+                // 文件开始包：header+文件名
+                header.crc32 = htonl(calculateHeaderCRC32(&header, filename, filename_len));
+            }
+            else if (len > 0 && data) {
+                // 普通数据包：header+data
+                header.crc32 = htonl(calculateHeaderCRC32(&header, data, len));
+            }
+            else {
+                // 仅header
+                header.crc32 = htonl(calculateHeaderCRC32(&header, NULL, 0));
+            }
             if (send(clients[i].socket, &header, sizeof(header), MSG_NOSIGNAL) == -1) {
                 fprintf(stderr, "发送头部失败: %s\n", strerror(errno));
                 continue;
             }
-
-            // 发送文件名(如果有)
-            if (filename_len > 0) {
+            if (filename_len > 0 && filename) {
                 if (send(clients[i].socket, filename, filename_len, MSG_NOSIGNAL) == -1) {
                     fprintf(stderr, "发送文件名失败: %s\n", strerror(errno));
                     continue;
                 }
             }
-
-            // 发送实际数据(如果有)
-            if (len > 0) {
+            if (len > 0 && data) {
                 if (send(clients[i].socket, data, len, MSG_NOSIGNAL) == -1) {
                     fprintf(stderr, "发送数据失败: %s\n", strerror(errno));
                     continue;
                 }
             }
-
-            // 日志记录
             printf("广播消息到客户端 %d: type=%u, msg_id=%u, chunk=%u/%u\n",
                 clients[i].id, msg_type, msg_id, chunk_index, chunk_count);
         }
@@ -267,26 +283,27 @@ void broadcast_message(Client clients[], int sender_fd, const void* data, size_t
 // 处理文本消息
 void handle_text_message(Client clients[], int client_fd, PacketHeader header) {
     char buffer[BUFFER_SIZE];
-    // 检查数据长度是否合法
     if (ntohl(header.datalen) >= BUFFER_SIZE) {
         fprintf(stderr, "文本消息过长\n");
         return;
     }
-
-    // 接收完整消息数据
     ssize_t bytes_read = recv(client_fd, buffer, ntohl(header.datalen), MSG_WAITALL);
     if (bytes_read != ntohl(header.datalen)) {
         fprintf(stderr, "文本消息接收不完整\n");
         return;
     }
-
     buffer[bytes_read] = '\0';
+    // CRC32校验
+    uint32_t crc_recv = ntohl(header.crc32);
+    uint32_t crc_calc = calculateHeaderCRC32(&header, buffer, bytes_read);
+    int ok = (crc_recv == crc_calc);
+    print_crc32_check("TEXT", ntohl(header.msg_id), crc_recv, crc_calc, 0, 1, ok);
+    if (!ok) {
+        fprintf(stderr, "CRC32校验失败，丢弃消息\n");
+        return;
+    }
     printf("收到文本消息: %s\n", buffer);
-
-    // 发送ACK确认
     send_ack(client_fd, ntohl(header.msg_id), ntohl(header.chunk_index));
-
-    // 广播文本消息给所有客户端
     broadcast_message(clients, client_fd, buffer, bytes_read, MSG_TYPE_TEXT,
         NULL, 0, 0, ntohl(header.msg_id), 0, 1, ntohl(header.sender_id));
 }
@@ -294,43 +311,40 @@ void handle_text_message(Client clients[], int client_fd, PacketHeader header) {
 // 处理文件开始传输消息
 void handle_file_start(Client clients[], int client_fd, PacketHeader header) {
     char filename[BUFFER_SIZE];
-    // 检查文件名长度
     if (ntohl(header.filename_len) >= BUFFER_SIZE) {
         fprintf(stderr, "文件名过长\n");
         return;
     }
-
-    // 接收文件名
     ssize_t bytes_read = recv(client_fd, filename, ntohl(header.filename_len), MSG_WAITALL);
     if (bytes_read != ntohl(header.filename_len)) {
         fprintf(stderr, "文件名接收不完整\n");
         return;
     }
     filename[bytes_read] = '\0';
-
-    // 加锁保护文件传输映射表
+    // CRC32校验
+    uint32_t crc_recv = ntohl(header.crc32);
+    uint32_t crc_calc = calculateHeaderCRC32(&header, filename, bytes_read);
+    int ok = (crc_recv == crc_calc);
+    print_crc32_check("FILE_START", ntohl(header.msg_id), crc_recv, crc_calc, 0, ntohl(header.chunk_count), ok);
+    if (!ok) {
+        fprintf(stderr, "CRC32校验失败，丢弃文件开始包\n");
+        return;
+    }
     pthread_mutex_lock(&file_mutex);
-    // 创建或获取文件传输记录
     FileTransfer& transfer = file_transfers[ntohl(header.msg_id)];
-    // 初始化传输记录
     transfer.msg_id = ntohl(header.msg_id);
     transfer.sender_id = ntohl(header.sender_id);
     strcpy(transfer.filename, filename);
     transfer.file_size = ntohll(header.file_size);
     transfer.chunk_count = ntohl(header.chunk_count);
     transfer.start_time = time(NULL);
-    transfer.file_fd = NULL; // 服务器不保存文件
+    transfer.file_fd = NULL;
     transfer.received_size = 0;
     transfer.received_chunks.clear();
     pthread_mutex_unlock(&file_mutex);
-
     printf("收到文件开始消息: %s (大小: %" PRIu64 " bytes, 分片数: %u)\n",
         filename, transfer.file_size, transfer.chunk_count);
-
-    // 发送ACK
     send_ack(client_fd, ntohl(header.msg_id), 0);
-
-    // 广播文件开始消息
     broadcast_message(clients, client_fd, NULL, 0, MSG_TYPE_FILE_START,
         filename, ntohl(header.filename_len), ntohll(header.file_size),
         ntohl(header.msg_id), 0, ntohl(header.chunk_count), ntohl(header.sender_id));
@@ -338,46 +352,32 @@ void handle_file_start(Client clients[], int client_fd, PacketHeader header) {
 
 // 处理文件分片消息
 void handle_file_chunk(Client clients[], int client_fd, PacketHeader header) {
-    // 解析头部信息
     uint32_t msg_id = ntohl(header.msg_id);
     uint32_t chunk_index = ntohl(header.chunk_index);
     uint32_t chunk_count = ntohl(header.chunk_count);
     uint32_t datalen = ntohl(header.datalen);
-
-    // 加锁访问文件传输映射表
     pthread_mutex_lock(&file_mutex);
-    // 查找对应的文件传输记录
     auto it = file_transfers.find(msg_id);
     if (it == file_transfers.end()) {
         pthread_mutex_unlock(&file_mutex);
         fprintf(stderr, "未找到文件传输记录: msg_id=%u\n", msg_id);
         return;
     }
-
     FileTransfer& transfer = it->second;
-
-    // 更新最后活动时间
     transfer.start_time = time(NULL);
-
-    // 检查分片大小是否合法
     if (datalen > CHUNK_SIZE) {
         pthread_mutex_unlock(&file_mutex);
         fprintf(stderr, "分片数据过大: %u > %u\n", datalen, CHUNK_SIZE);
         return;
     }
-
-    // 接收分片数据
     char buffer[BUFFER_SIZE];
     ssize_t bytes_read = 0;
     size_t total_read = 0;
-
-    // 循环接收直到数据完整
     while (total_read < datalen) {
         bytes_read = recv(client_fd, buffer + total_read, datalen - total_read, 0);
         if (bytes_read <= 0) {
-            // 处理非阻塞情况下的暂时无数据
             if (bytes_read == -1 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                usleep(1000); // 等待1ms
+                usleep(1000);
                 continue;
             }
             pthread_mutex_unlock(&file_mutex);
@@ -386,62 +386,68 @@ void handle_file_chunk(Client clients[], int client_fd, PacketHeader header) {
         }
         total_read += bytes_read;
     }
-
-    // 验证接收完整性
     if (total_read != datalen) {
         pthread_mutex_unlock(&file_mutex);
         fprintf(stderr, "文件分片接收不完整: 期望%d, 实际%zu\n", datalen, total_read);
         return;
     }
-
-    // 更新传输状态
+    // CRC32校验
+    uint32_t crc_recv = ntohl(header.crc32);
+    uint32_t crc_calc = calculateHeaderCRC32(&header, buffer, total_read);
+    int ok = (crc_recv == crc_calc);
+    print_crc32_check("FILE_CHUNK", msg_id, crc_recv, crc_calc, chunk_index, chunk_count, ok);
+    if (!ok) {
+        pthread_mutex_unlock(&file_mutex);
+        fprintf(stderr, "CRC32校验失败，丢弃文件分片\n");
+        return;
+    }
     transfer.received_chunks[chunk_index] = true;
     transfer.received_size += total_read;
-
     pthread_mutex_unlock(&file_mutex);
-
-    // 发送ACK确认
     send_ack(client_fd, msg_id, chunk_index);
-
-    // 广播文件分片给所有客户端
     broadcast_message(clients, client_fd, buffer, total_read, MSG_TYPE_FILE_CHUNK,
         NULL, 0, 0, msg_id, chunk_index, chunk_count, ntohl(header.sender_id));
-
     printf("转发文件分片: msg_id=%u, chunk=%u/%u, size=%zu\n",
         msg_id, chunk_index, chunk_count, total_read);
-
 }
 
 // 处理文件结束消息
 void handle_file_end(Client clients[], int client_fd, PacketHeader header) {
     uint32_t msg_id = ntohl(header.msg_id);
-
+    // CRC32校验
+    uint32_t crc_recv = ntohl(header.crc32);
+    uint32_t crc_calc = calculateHeaderCRC32(&header, NULL, 0);
+    int ok = (crc_recv == crc_calc);
+    print_crc32_check("FILE_END", msg_id, crc_recv, crc_calc, 0, 0, ok);
+    if (!ok) {
+        fprintf(stderr, "CRC32校验失败，丢弃文件结束包\n");
+        return;
+    }
     pthread_mutex_lock(&file_mutex);
-    // 查找文件传输记录
     auto it = file_transfers.find(msg_id);
     if (it != file_transfers.end()) {
         FileTransfer& transfer = it->second;
-
-        // 打印传输完成日志
         printf("文件传输完成: %s (msg_id=%u, 转发大小: %" PRIu64 ")\n",
             transfer.filename, msg_id, transfer.received_size);
-
-        // 从映射表中移除
         file_transfers.erase(it);
     }
     pthread_mutex_unlock(&file_mutex);
-
-    // 发送ACK确认
     send_ack(client_fd, msg_id, 0);
-
-    // 广播文件结束消息
     broadcast_message(clients, client_fd, NULL, 0, MSG_TYPE_FILE_END,
         NULL, 0, 0, msg_id, 0, 0, ntohl(header.sender_id));
 }
 
 // 处理ACK消息
 void handle_ack_message(int client_fd, PacketHeader header) {
-    // 解析ACK信息
+    // CRC32校验
+    uint32_t crc_recv = ntohl(header.crc32);
+    uint32_t crc_calc = calculateHeaderCRC32(&header, NULL, 0);
+    int ok = (crc_recv == crc_calc);
+    print_crc32_check("ACK", ntohl(header.msg_id), crc_recv, crc_calc, ntohl(header.chunk_index), 0, ok);
+    if (!ok) {
+        fprintf(stderr, "CRC32校验失败，丢弃ACK包\n");
+        return;
+    }
     uint32_t msg_id = ntohl(header.msg_id);
     uint32_t chunk_index = ntohl(header.chunk_index);
     printf("收到ACK: msg_id=%u, chunk=%u\n", msg_id, chunk_index);
