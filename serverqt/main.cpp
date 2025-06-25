@@ -25,6 +25,8 @@
 #define CHUNK_SIZE 32768      // 文件分片大小(32KB)
 #define MY_PROTOCOL_VERSION 1 // 自定义协议版本号
 #define ACK_TIMEOUT 5000      // ACK超时时间(5秒)
+#define FORWARD_RETRY_LIMIT 5
+#define FORWARD_TIMEOUT 3 // 秒
 
 // 消息类型定义
 #define MSG_TYPE_TEXT 1        // 文本消息
@@ -81,6 +83,18 @@ typedef struct {
 std::map<uint32_t, FileTransfer> file_transfers; // 文件传输状态映射表
 pthread_mutex_t file_mutex = PTHREAD_MUTEX_INITIALIZER; // 文件互斥锁
 uint32_t next_msg_id = 1;               // 下一个消息ID(原子递增)
+
+struct ForwardTask {
+    PacketHeader header;
+    std::vector<uint8_t> payload;
+    int client_fd;
+    int retry_count;
+    time_t last_send_time;
+    uint32_t msg_id;
+    uint32_t chunk_index;
+};
+std::vector<ForwardTask> forward_tasks;
+pthread_mutex_t forward_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // 网络字节序转换(64位)
 uint64_t htonll(uint64_t value) {
@@ -252,6 +266,48 @@ void broadcast_client_list(Client clients[]) {
     }
 }
 
+void reliable_forward(int client_fd, const PacketHeader& header, const void* data, size_t len) {
+    ForwardTask task;
+    task.header = header;
+    if (data && len > 0)
+        task.payload.assign((uint8_t*)data, (uint8_t*)data + len);
+    task.client_fd = client_fd;
+    task.retry_count = 0;
+    task.last_send_time = time(NULL);
+    task.msg_id = ntohl(header.msg_id);
+    task.chunk_index = ntohl(header.chunk_index);
+
+    pthread_mutex_lock(&forward_mutex);
+    forward_tasks.push_back(task);
+    pthread_mutex_unlock(&forward_mutex);
+
+    // 立即发送一次
+    send(client_fd, &header, sizeof(header), MSG_NOSIGNAL);
+    if (len > 0) send(client_fd, data, len, MSG_NOSIGNAL);
+}
+
+void check_forward_timeouts() {
+    time_t now = time(NULL);
+    pthread_mutex_lock(&forward_mutex);
+    for (auto it = forward_tasks.begin(); it != forward_tasks.end(); ) {
+        if (now - it->last_send_time >= FORWARD_TIMEOUT) {
+            if (it->retry_count >= FORWARD_RETRY_LIMIT) {
+                printf("转发包重试超限，msg_id=%u, chunk=%u, fd=%d\n", it->msg_id, it->chunk_index, it->client_fd);
+                it = forward_tasks.erase(it);
+                continue;
+            }
+            // 重发
+            send(it->client_fd, &it->header, sizeof(it->header), MSG_NOSIGNAL);
+            if (!it->payload.empty())
+                send(it->client_fd, it->payload.data(), it->payload.size(), MSG_NOSIGNAL);
+            it->retry_count++;
+            it->last_send_time = now;
+        }
+        ++it;
+    }
+    pthread_mutex_unlock(&forward_mutex);
+}
+
 // 广播消息给所有客户端(核心转发函数)
 void broadcast_message(Client clients[], int sender_fd, const void* data, size_t len,
     uint8_t msg_type, const char* filename, uint32_t filename_len, uint64_t file_size,
@@ -272,32 +328,16 @@ void broadcast_message(Client clients[], int sender_fd, const void* data, size_t
             };
             // 计算CRC32
             if (filename_len > 0 && filename) {
-                // 文件开始包：header+文件名
                 header.crc32 = htonl(calculateHeaderCRC32(&header, filename, filename_len));
+                reliable_forward(clients[i].socket, header, filename, filename_len);
             }
             else if (len > 0 && data) {
-                // 普通数据包：header+data
                 header.crc32 = htonl(calculateHeaderCRC32(&header, data, len));
+                reliable_forward(clients[i].socket, header, data, len);
             }
             else {
-                // 仅header
                 header.crc32 = htonl(calculateHeaderCRC32(&header, NULL, 0));
-            }
-            if (send(clients[i].socket, &header, sizeof(header), MSG_NOSIGNAL) == -1) {
-                fprintf(stderr, "发送头部失败: %s\n", strerror(errno));
-                continue;
-            }
-            if (filename_len > 0 && filename) {
-                if (send(clients[i].socket, filename, filename_len, MSG_NOSIGNAL) == -1) {
-                    fprintf(stderr, "发送文件名失败: %s\n", strerror(errno));
-                    continue;
-                }
-            }
-            if (len > 0 && data) {
-                if (send(clients[i].socket, data, len, MSG_NOSIGNAL) == -1) {
-                    fprintf(stderr, "发送数据失败: %s\n", strerror(errno));
-                    continue;
-                }
+                reliable_forward(clients[i].socket, header, NULL, 0);
             }
             printf("广播消息到客户端 %d: type=%u, msg_id=%u, chunk=%u/%u\n",
                 clients[i].id, msg_type, msg_id, chunk_index, chunk_count);
@@ -476,6 +516,16 @@ void handle_ack_message(int client_fd, PacketHeader header) {
     uint32_t msg_id = ntohl(header.msg_id);
     uint32_t chunk_index = ntohl(header.chunk_index);
     printf("收到ACK: msg_id=%u, chunk=%u\n", msg_id, chunk_index);
+    pthread_mutex_lock(&forward_mutex);
+    for (auto it = forward_tasks.begin(); it != forward_tasks.end(); ) {
+        if (it->client_fd == client_fd && it->msg_id == msg_id && it->chunk_index == chunk_index) {
+            it = forward_tasks.erase(it);
+        }
+        else {
+            ++it;
+        }
+    }
+    pthread_mutex_unlock(&forward_mutex);
 }
 
 // 清理超时的文件传输
@@ -766,6 +816,7 @@ int main() {
                 }
             }
         }
+        check_forward_timeouts();
     }
 
     // 清理资源
