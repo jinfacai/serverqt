@@ -346,7 +346,7 @@ void broadcast_message(Client clients[], int sender_fd, const void* data, size_t
 }
 
 // 处理文本消息
-void handle_text_message(Client clients[], int client_fd, PacketHeader header) {
+void handle_text_message(MYSQL* conn, Client clients[], int client_fd, PacketHeader header) {
     char buffer[BUFFER_SIZE];
     if (ntohl(header.datalen) >= BUFFER_SIZE) {
         fprintf(stderr, "文本消息过长\n");
@@ -368,13 +368,29 @@ void handle_text_message(Client clients[], int client_fd, PacketHeader header) {
         return;
     }
     printf("收到文本消息: %s\n", buffer);
+    // 插入messages表
+    char sql[1024];
+    snprintf(sql, sizeof(sql),
+        "INSERT INTO messages (sender_id, type, content, file_size) VALUES (%u, 1, '%s', 0)",
+        ntohl(header.sender_id), buffer);
+    mysql_query(conn, sql);
+    int message_id = mysql_insert_id(conn);
+    // 广播并插入deliveries表
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].socket != -1 && clients[i].is_online) {
+            snprintf(sql, sizeof(sql),
+                "INSERT INTO deliveries (message_id, client_id) VALUES (%d, %d)",
+                message_id, clients[i].id);
+            mysql_query(conn, sql);
+        }
+    }
     send_ack(client_fd, ntohl(header.msg_id), ntohl(header.chunk_index));
     broadcast_message(clients, client_fd, buffer, bytes_read, MSG_TYPE_TEXT,
         NULL, 0, 0, ntohl(header.msg_id), 0, 1, ntohl(header.sender_id));
 }
 
 // 处理文件开始传输消息
-void handle_file_start(Client clients[], int client_fd, PacketHeader header) {
+void handle_file_start(MYSQL* conn, Client clients[], int client_fd, PacketHeader header) {
     char filename[BUFFER_SIZE];
     if (ntohl(header.filename_len) >= BUFFER_SIZE) {
         fprintf(stderr, "文件名过长\n");
@@ -409,6 +425,22 @@ void handle_file_start(Client clients[], int client_fd, PacketHeader header) {
     pthread_mutex_unlock(&file_mutex);
     printf("收到文件开始消息: %s (大小: %" PRIu64 " bytes, 分片数: %u)\n",
         filename, transfer.file_size, transfer.chunk_count);
+    // 插入messages表
+    char sql[1024];
+    snprintf(sql, sizeof(sql),
+        "INSERT INTO messages (sender_id, type, content, file_size) VALUES (%u, 2, '%s', %" PRIu64 ")",
+        ntohl(header.sender_id), filename, ntohll(header.file_size));
+    mysql_query(conn, sql);
+    int message_id = mysql_insert_id(conn);
+    // 广播并插入deliveries表
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].socket != -1 && clients[i].is_online) {
+            snprintf(sql, sizeof(sql),
+                "INSERT INTO deliveries (message_id, client_id) VALUES (%d, %d)",
+                message_id, clients[i].id);
+            mysql_query(conn, sql);
+        }
+    }
     send_ack(client_fd, ntohl(header.msg_id), 0);
     broadcast_message(clients, client_fd, NULL, 0, MSG_TYPE_FILE_START,
         filename, ntohl(header.filename_len), ntohll(header.file_size),
@@ -416,7 +448,7 @@ void handle_file_start(Client clients[], int client_fd, PacketHeader header) {
 }
 
 // 处理文件分片消息
-void handle_file_chunk(Client clients[], int client_fd, PacketHeader header) {
+void handle_file_chunk(MYSQL* conn, Client clients[], int client_fd, PacketHeader header) {
     uint32_t msg_id = ntohl(header.msg_id);
     uint32_t chunk_index = ntohl(header.chunk_index);
     uint32_t chunk_count = ntohl(header.chunk_count);
@@ -477,7 +509,7 @@ void handle_file_chunk(Client clients[], int client_fd, PacketHeader header) {
 }
 
 // 处理文件结束消息
-void handle_file_end(Client clients[], int client_fd, PacketHeader header) {
+void handle_file_end(MYSQL* conn, Client clients[], int client_fd, PacketHeader header) {
     uint32_t msg_id = ntohl(header.msg_id);
     // CRC32校验
     uint32_t crc_recv = ntohl(header.crc32);
@@ -503,7 +535,7 @@ void handle_file_end(Client clients[], int client_fd, PacketHeader header) {
 }
 
 // 处理ACK消息
-void handle_ack_message(int client_fd, PacketHeader header) {
+void handle_ack_message(MYSQL* conn, Client clients[], int client_fd, PacketHeader header) {
     // CRC32校验
     uint32_t crc_recv = ntohl(header.crc32);
     uint32_t crc_calc = calculateHeaderCRC32(&header, NULL, 0);
@@ -526,6 +558,21 @@ void handle_ack_message(int client_fd, PacketHeader header) {
         }
     }
     pthread_mutex_unlock(&forward_mutex);
+    // 查找client_id
+    int client_id = -1;
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].socket == client_fd) {
+            client_id = clients[i].id;
+            break;
+        }
+    }
+    if (client_id > 0) {
+        char sql[256];
+        snprintf(sql, sizeof(sql),
+            "UPDATE deliveries SET delivered=1, ack_time=NOW() WHERE message_id=%u AND client_id=%d",
+            msg_id, client_id);
+        mysql_query(conn, sql);
+    }
 }
 
 // 清理超时的文件传输
@@ -546,6 +593,34 @@ void cleanup_timeout_transfers() {
     pthread_mutex_unlock(&file_mutex);
 }
 
+// 启动时自动建表
+void init_db_tables(MYSQL* conn) {
+    const char* create_clients =
+        "CREATE TABLE IF NOT EXISTS clients ("
+        "id INT PRIMARY KEY AUTO_INCREMENT, "
+        "ip VARCHAR(15), "
+        "port INT, "
+        "reg_time DATETIME DEFAULT CURRENT_TIMESTAMP)";
+    const char* create_messages =
+        "CREATE TABLE IF NOT EXISTS messages ("
+        "id INT PRIMARY KEY AUTO_INCREMENT, "
+        "sender_id INT, "
+        "type TINYINT, "
+        "content TEXT, "
+        "file_size BIGINT, "
+        "send_time DATETIME DEFAULT CURRENT_TIMESTAMP)";
+    const char* create_deliveries =
+        "CREATE TABLE IF NOT EXISTS deliveries ("
+        "id INT PRIMARY KEY AUTO_INCREMENT, "
+        "message_id INT, "
+        "client_id INT, "
+        "delivered TINYINT DEFAULT 0, "
+        "ack_time DATETIME)";
+    mysql_query(conn, create_clients);
+    mysql_query(conn, create_messages);
+    mysql_query(conn, create_deliveries);
+}
+
 // 主函数
 int main() {
     // 初始化MySQL连接
@@ -555,21 +630,8 @@ int main() {
         exit(EXIT_FAILURE);
     }
 
-    // 创建客户端表
-    if (mysql_query(conn, "DROP TABLE IF EXISTS clients") != 0) {
-        fprintf(stderr, "删除旧表失败: %s\n", mysql_error(conn));
-    }
-
-    if (mysql_query(conn,
-        "CREATE TABLE clients ("
-        "id INT AUTO_INCREMENT PRIMARY KEY, "
-        "ip VARCHAR(15) NOT NULL, "
-        "port INT NOT NULL)"
-    ) != 0) {
-        fprintf(stderr, "创建表失败: %s\n", mysql_error(conn));
-        mysql_close(conn);
-        exit(EXIT_FAILURE);
-    }
+    // 启动时自动建表
+    init_db_tables(conn);
 
     // 获取服务器端口号
     int port = 8888; // 默认端口
@@ -724,6 +786,12 @@ int main() {
                     clients[client_idx].port = client_port;
                     clients[client_idx].is_online = true;
                     clients[client_idx].last_activity = time(NULL);
+                    // 插入clients表（如果已存在可忽略）
+                    char sql[512];
+                    snprintf(sql, sizeof(sql),
+                        "INSERT IGNORE INTO clients (id, ip, port) VALUES (%d, '%s', %d)",
+                        new_id, client_ip, client_port);
+                    mysql_query(conn, sql);
                 }
                 else {
                     printf("客户端ID生成失败，拒绝连接: IP=%s Port=%d\n", client_ip, client_port);
@@ -796,19 +864,19 @@ int main() {
                 // 根据消息类型分发处理
                 switch (header.msg_type) {
                 case MSG_TYPE_TEXT:
-                    handle_text_message(clients, fd, header);
+                    handle_text_message(conn, clients, fd, header);
                     break;
                 case MSG_TYPE_FILE_START:
-                    handle_file_start(clients, fd, header);
+                    handle_file_start(conn, clients, fd, header);
                     break;
                 case MSG_TYPE_FILE_CHUNK:
-                    handle_file_chunk(clients, fd, header);
+                    handle_file_chunk(conn, clients, fd, header);
                     break;
                 case MSG_TYPE_FILE_END:
-                    handle_file_end(clients, fd, header);
+                    handle_file_end(conn, clients, fd, header);
                     break;
                 case MSG_TYPE_ACK:
-                    handle_ack_message(fd, header);
+                    handle_ack_message(conn, clients, fd, header);
                     break;
                 default:
                     fprintf(stderr, "未知消息类型: %d\n", header.msg_type);
