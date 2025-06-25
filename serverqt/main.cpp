@@ -34,6 +34,7 @@
 #define MSG_TYPE_FILE_CHUNK 5  // 文件分片
 #define MSG_TYPE_FILE_START 6  // 文件开始传输
 #define MSG_TYPE_FILE_END 7    // 文件结束传输
+#define MSG_TYPE_ID_ASSIGN 8   // 客户端ID分配
 
 // 增强版协议包头(使用packed属性避免内存对齐)
 typedef struct {
@@ -176,6 +177,30 @@ void send_ack(int client_fd, uint32_t msg_id, uint32_t chunk_index) {
     ack_header.crc32 = htonl(calculateHeaderCRC32(&ack_header, NULL, 0));
     if (send(client_fd, &ack_header, sizeof(ack_header), MSG_NOSIGNAL) == -1) {
         fprintf(stderr, "发送ACK失败: %s\n", strerror(errno));
+    }
+}
+
+// 发送客户端ID分配消息
+void send_id_assign(int client_fd, uint32_t assigned_id) {
+    PacketHeader id_header = {
+        .version = MY_PROTOCOL_VERSION,
+        .msg_type = MSG_TYPE_ID_ASSIGN,
+        .datalen = 0,
+        .filename_len = 0,
+        .file_size = 0,
+        .msg_id = htonl(generate_msg_id()),
+        .chunk_index = 0,
+        .chunk_count = 0,
+        .sender_id = htonl(assigned_id),
+        .crc32 = 0
+    };
+    // 计算CRC32
+    id_header.crc32 = htonl(calculateHeaderCRC32(&id_header, NULL, 0));
+    if (send(client_fd, &id_header, sizeof(id_header), MSG_NOSIGNAL) == -1) {
+        fprintf(stderr, "发送ID分配消息失败: %s\n", strerror(errno));
+    }
+    else {
+        printf("已向客户端发送ID分配消息: ID=%u\n", assigned_id);
     }
 }
 
@@ -659,6 +684,9 @@ int main() {
                 // 记录套接字并重置接收状态
                 clients[client_idx].socket = client_fd;
                 clients[client_idx].received_size = 0;
+
+                // 发送ID分配消息给新客户端
+                send_id_assign(client_fd, new_id);
 
                 // 添加到epoll监控
                 event.data.fd = client_fd;
