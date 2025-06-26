@@ -92,6 +92,7 @@ struct ForwardTask {
     time_t last_send_time;
     uint32_t msg_id;
     uint32_t chunk_index;
+    uint8_t msg_type;
 };
 std::vector<ForwardTask> forward_tasks;
 pthread_mutex_t forward_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -189,8 +190,18 @@ void send_ack(int client_fd, uint32_t msg_id, uint32_t chunk_index) {
     };
     // 计算CRC32
     ack_header.crc32 = htonl(calculateHeaderCRC32(&ack_header, NULL, 0));
-    if (send(client_fd, &ack_header, sizeof(ack_header), MSG_NOSIGNAL) == -1) {
-        fprintf(stderr, "发送ACK失败: %s\n", strerror(errno));
+
+    ssize_t ackWritten = send(client_fd, &ack_header, sizeof(ack_header), MSG_NOSIGNAL);
+    if (ackWritten == -1) {
+        fprintf(stderr, "[send_ack] ACK发送失败: %s (fd=%d, msg_id=%u, chunk=%u)\n",
+            strerror(errno), client_fd, msg_id, chunk_index);
+    }
+    else if (ackWritten != sizeof(ack_header)) {
+        fprintf(stderr, "[send_ack] ACK写入不完整: 已发送%zd字节/应发送%zu字节 (fd=%d, msg_id=%u, chunk=%u)\n",
+            ackWritten, sizeof(ack_header), client_fd, msg_id, chunk_index);
+    }
+    else {
+        printf("[send_ack] ACK发送成功: msg_id=%u, chunk=%u, fd=%d\n", msg_id, chunk_index, client_fd);
     }
 }
 
@@ -210,11 +221,18 @@ void send_id_assign(int client_fd, uint32_t assigned_id) {
     };
     // 计算CRC32
     id_header.crc32 = htonl(calculateHeaderCRC32(&id_header, NULL, 0));
-    if (send(client_fd, &id_header, sizeof(id_header), MSG_NOSIGNAL) == -1) {
-        fprintf(stderr, "发送ID分配消息失败: %s\n", strerror(errno));
+
+    ssize_t idWritten = send(client_fd, &id_header, sizeof(id_header), MSG_NOSIGNAL);
+    if (idWritten == -1) {
+        fprintf(stderr, "[send_id_assign] ID分配消息发送失败: %s (fd=%d, assigned_id=%u)\n",
+            strerror(errno), client_fd, assigned_id);
+    }
+    else if (idWritten != sizeof(id_header)) {
+        fprintf(stderr, "[send_id_assign] ID分配消息写入不完整: 已发送%zd字节/应发送%zu字节 (fd=%d, assigned_id=%u)\n",
+            idWritten, sizeof(id_header), client_fd, assigned_id);
     }
     else {
-        printf("已向客户端发送ID分配消息: ID=%u\n", assigned_id);
+        printf("[send_id_assign] 已向客户端发送ID分配消息: ID=%u, fd=%d\n", assigned_id, client_fd);
     }
 }
 
@@ -276,14 +294,56 @@ void reliable_forward(int client_fd, const PacketHeader& header, const void* dat
     task.last_send_time = time(NULL);
     task.msg_id = ntohl(header.msg_id);
     task.chunk_index = ntohl(header.chunk_index);
+    task.msg_type = header.msg_type;
 
     pthread_mutex_lock(&forward_mutex);
     forward_tasks.push_back(task);
     pthread_mutex_unlock(&forward_mutex);
 
-    // 立即发送一次
-    send(client_fd, &header, sizeof(header), MSG_NOSIGNAL);
-    if (len > 0) send(client_fd, data, len, MSG_NOSIGNAL);
+    // 检查header写入
+    ssize_t headerWritten = send(client_fd, &header, sizeof(header), MSG_NOSIGNAL);
+    if (headerWritten == -1) {
+        const char* type_str = (header.msg_type == MSG_TYPE_TEXT) ? "文本" :
+            (header.msg_type == MSG_TYPE_FILE_START) ? "文件名" :
+            (header.msg_type == MSG_TYPE_FILE_CHUNK) ? "文件块" : "其他";
+        fprintf(stderr, "[reliable_forward] 发送%s协议头失败: %s (fd=%d, msg_id=%u)\n",
+            type_str, strerror(errno), client_fd, task.msg_id);
+        return;
+    }
+    else if (headerWritten != sizeof(header)) {
+        const char* type_str = (header.msg_type == MSG_TYPE_TEXT) ? "文本" :
+            (header.msg_type == MSG_TYPE_FILE_START) ? "文件名" :
+            (header.msg_type == MSG_TYPE_FILE_CHUNK) ? "文件块" : "其他";
+        fprintf(stderr, "[reliable_forward] %s协议头写入不完整: 已发送%zd字节/应发送%zu字节 (fd=%d, msg_id=%u)\n",
+            type_str, headerWritten, sizeof(header), client_fd, task.msg_id);
+        // 写入不完整，依赖重传机制处理
+    }
+
+    // 检查data写入
+    if (len > 0 && data) {
+        ssize_t dataWritten = send(client_fd, data, len, MSG_NOSIGNAL);
+        if (dataWritten == -1) {
+            const char* type_str = (header.msg_type == MSG_TYPE_TEXT) ? "文本" :
+                (header.msg_type == MSG_TYPE_FILE_START) ? "文件名" :
+                (header.msg_type == MSG_TYPE_FILE_CHUNK) ? "文件块" : "其他";
+            fprintf(stderr, "[reliable_forward] 发送%s数据失败: %s (fd=%d, msg_id=%u)\n",
+                type_str, strerror(errno), client_fd, task.msg_id);
+            return;
+        }
+        else if (dataWritten != (ssize_t)len) {
+            const char* type_str = (header.msg_type == MSG_TYPE_TEXT) ? "文本" :
+                (header.msg_type == MSG_TYPE_FILE_START) ? "文件名" :
+                (header.msg_type == MSG_TYPE_FILE_CHUNK) ? "文件块" : "其他";
+            fprintf(stderr, "[reliable_forward] %s数据写入不完整: 已发送%zd字节/应发送%zu字节 (fd=%d, msg_id=%u)\n",
+                type_str, dataWritten, len, client_fd, task.msg_id);
+            // 写入不完整，依赖重传机制处理
+        }
+    }
+
+    const char* type_str = (header.msg_type == MSG_TYPE_TEXT) ? "文本" :
+        (header.msg_type == MSG_TYPE_FILE_START) ? "文件名" :
+        (header.msg_type == MSG_TYPE_FILE_CHUNK) ? "文件块" : "其他";
+    printf("[reliable_forward] 发送类型:%s msg_id=%u chunk=%u fd=%d\n", type_str, task.msg_id, task.chunk_index, client_fd);
 }
 
 void check_forward_timeouts() {
@@ -292,16 +352,56 @@ void check_forward_timeouts() {
     for (auto it = forward_tasks.begin(); it != forward_tasks.end(); ) {
         if (now - it->last_send_time >= FORWARD_TIMEOUT) {
             if (it->retry_count >= FORWARD_RETRY_LIMIT) {
-                printf("转发包重试超限，msg_id=%u, chunk=%u, fd=%d\n", it->msg_id, it->chunk_index, it->client_fd);
+                const char* type_str = (it->msg_type == MSG_TYPE_TEXT) ? "文本" :
+                    (it->msg_type == MSG_TYPE_FILE_START) ? "文件名" :
+                    (it->msg_type == MSG_TYPE_FILE_CHUNK) ? "文件块" : "其他";
+                printf("[重传超限] 类型:%s msg_id=%u, chunk=%u, fd=%d\n", type_str, it->msg_id, it->chunk_index, it->client_fd);
                 it = forward_tasks.erase(it);
                 continue;
             }
             // 重发
-            send(it->client_fd, &it->header, sizeof(it->header), MSG_NOSIGNAL);
-            if (!it->payload.empty())
-                send(it->client_fd, it->payload.data(), it->payload.size(), MSG_NOSIGNAL);
-            it->retry_count++;
-            it->last_send_time = now;
+            ssize_t headerWritten = send(it->client_fd, &it->header, sizeof(it->header), MSG_NOSIGNAL);
+            if (headerWritten == -1) {
+                const char* type_str = (it->msg_type == MSG_TYPE_TEXT) ? "文本" :
+                    (it->msg_type == MSG_TYPE_FILE_START) ? "文件名" :
+                    (it->msg_type == MSG_TYPE_FILE_CHUNK) ? "文件块" : "其他";
+                fprintf(stderr, "[重传] %s协议头发送失败: %s (fd=%d, msg_id=%u, 第%d次)\n",
+                    type_str, strerror(errno), it->client_fd, it->msg_id, it->retry_count);
+                it->retry_count++;
+                it->last_send_time = now;
+                ++it;
+                continue;
+            }
+            else if (headerWritten != sizeof(it->header)) {
+                const char* type_str = (it->msg_type == MSG_TYPE_TEXT) ? "文本" :
+                    (it->msg_type == MSG_TYPE_FILE_START) ? "文件名" :
+                    (it->msg_type == MSG_TYPE_FILE_CHUNK) ? "文件块" : "其他";
+                fprintf(stderr, "[重传] %s协议头写入不完整: 已发送%zd字节/应发送%zu字节 (fd=%d, msg_id=%u, 第%d次)\n",
+                    type_str, headerWritten, sizeof(it->header), it->client_fd, it->msg_id, it->retry_count);
+            }
+
+            ssize_t dataWritten = 0;
+            if (!it->payload.empty()) {
+                dataWritten = send(it->client_fd, it->payload.data(), it->payload.size(), MSG_NOSIGNAL);
+                if (dataWritten == -1) {
+                    const char* type_str = (it->msg_type == MSG_TYPE_TEXT) ? "文本" :
+                        (it->msg_type == MSG_TYPE_FILE_START) ? "文件名" :
+                        (it->msg_type == MSG_TYPE_FILE_CHUNK) ? "文件块" : "其他";
+                    fprintf(stderr, "[重传] %s数据发送失败: %s (fd=%d, msg_id=%u, 第%d次)\n",
+                        type_str, strerror(errno), it->client_fd, it->msg_id, it->retry_count);
+                    it->retry_count++;
+                    it->last_send_time = now;
+                    ++it;
+                    continue;
+                }
+                else if (dataWritten != (ssize_t)it->payload.size()) {
+                    const char* type_str = (it->msg_type == MSG_TYPE_TEXT) ? "文本" :
+                        (it->msg_type == MSG_TYPE_FILE_START) ? "文件名" :
+                        (it->msg_type == MSG_TYPE_FILE_CHUNK) ? "文件块" : "其他";
+                    fprintf(stderr, "[重传] %s数据写入不完整: 已发送%zd字节/应发送%zu字节 (fd=%d, msg_id=%u, 第%d次)\n",
+                        type_str, dataWritten, it->payload.size(), it->client_fd, it->msg_id, it->retry_count);
+                }
+            }
         }
         ++it;
     }
@@ -339,8 +439,11 @@ void broadcast_message(Client clients[], int sender_fd, const void* data, size_t
                 header.crc32 = htonl(calculateHeaderCRC32(&header, NULL, 0));
                 reliable_forward(clients[i].socket, header, NULL, 0);
             }
-            printf("广播消息到客户端 %d: type=%u, msg_id=%u, chunk=%u/%u\n",
-                clients[i].id, msg_type, msg_id, chunk_index, chunk_count);
+            const char* type_str = (msg_type == MSG_TYPE_TEXT) ? "文本" :
+                (msg_type == MSG_TYPE_FILE_START) ? "文件名" :
+                (msg_type == MSG_TYPE_FILE_CHUNK) ? "文件块" : "其他";
+            printf("[广播] 发送到客户端 %d: 类型=%s, msg_id=%u, chunk=%u/%u\n",
+                clients[i].id, type_str, msg_id, chunk_index, chunk_count);
         }
     }
 }
