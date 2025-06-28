@@ -37,6 +37,7 @@
 #define MSG_TYPE_FILE_START 6  // 文件开始传输
 #define MSG_TYPE_FILE_END 7    // 文件结束传输
 #define MSG_TYPE_ID_ASSIGN 8   // 客户端ID分配
+#define MSG_TYPE_REFUSE 9      // 客户端拒绝接收
 
 // 增强版协议包头(使用packed属性避免内存对齐)
 typedef struct {
@@ -359,6 +360,23 @@ void check_forward_timeouts() {
     for (auto it = forward_tasks.begin();
         it != forward_tasks.end() && processed_count < MAX_PROCESS_PER_CYCLE; ) {
 
+        // 检查文件传输是否已完成，如果已完成则清理该任务
+        if (it->msg_type == MSG_TYPE_FILE_CHUNK || it->msg_type == MSG_TYPE_FILE_START) {
+            pthread_mutex_lock(&file_mutex);
+            auto file_it = file_transfers.find(it->msg_id);
+            if (file_it == file_transfers.end()) {
+                // 文件传输已完成或不存在，清理该转发任务
+                const char* type_str = (it->msg_type == MSG_TYPE_FILE_START) ? "文件名" : "文件块";
+                printf("[清理已完成传输] 类型:%s msg_id=%u, chunk=%u, fd=%d\n",
+                    type_str, it->msg_id, it->chunk_index, it->client_fd);
+                it = forward_tasks.erase(it);
+                pthread_mutex_unlock(&file_mutex);
+                continue;
+            }
+            pthread_mutex_unlock(&file_mutex);
+        }
+
+        // 检查是否超时
         if (now - it->last_send_time >= FORWARD_TIMEOUT) {
             if (it->retry_count >= FORWARD_RETRY_LIMIT) {
                 const char* type_str = (it->msg_type == MSG_TYPE_TEXT) ? "文本" :
@@ -665,6 +683,7 @@ void handle_file_end(MYSQL* conn, Client clients[], int client_fd, PacketHeader 
         fprintf(stderr, "CRC32校验失败，丢弃文件结束包\n");
         return;
     }
+
     pthread_mutex_lock(&file_mutex);
     auto it = file_transfers.find(msg_id);
     if (it != file_transfers.end()) {
@@ -674,6 +693,21 @@ void handle_file_end(MYSQL* conn, Client clients[], int client_fd, PacketHeader 
         file_transfers.erase(it);
     }
     pthread_mutex_unlock(&file_mutex);
+
+    // 清理所有相关的转发任务，防止重传循环
+    pthread_mutex_lock(&forward_mutex);
+    for (auto forward_it = forward_tasks.begin(); forward_it != forward_tasks.end(); ) {
+        if (forward_it->msg_id == msg_id) {
+            printf("清理文件传输完成后的转发任务: msg_id=%u, chunk=%u, type=%d\n",
+                forward_it->msg_id, forward_it->chunk_index, forward_it->msg_type);
+            forward_it = forward_tasks.erase(forward_it);
+        }
+        else {
+            ++forward_it;
+        }
+    }
+    pthread_mutex_unlock(&forward_mutex);
+
     send_ack(client_fd, msg_id, 0);
     broadcast_message(clients, client_fd, NULL, 0, MSG_TYPE_FILE_END,
         NULL, 0, 0, msg_id, 0, 0, ntohl(header.sender_id));
@@ -693,16 +727,55 @@ void handle_ack_message(MYSQL* conn, Client clients[], int client_fd, PacketHead
     uint32_t msg_id = ntohl(header.msg_id);
     uint32_t chunk_index = ntohl(header.chunk_index);
     printf("收到ACK: msg_id=%u, chunk=%u\n", msg_id, chunk_index);
+
     pthread_mutex_lock(&forward_mutex);
-    for (auto it = forward_tasks.begin(); it != forward_tasks.end(); ) {
-        if (it->client_fd == client_fd && it->msg_id == msg_id && it->chunk_index == chunk_index) {
-            it = forward_tasks.erase(it);
+
+    // 如果是文件结束的ACK（chunk_index=0且文件传输已完成），清理所有相关的转发任务
+    if (chunk_index == 0) {
+        pthread_mutex_lock(&file_mutex);
+        auto file_it = file_transfers.find(msg_id);
+        if (file_it == file_transfers.end()) {
+            // 文件传输已完成，清理所有相关的转发任务
+            for (auto it = forward_tasks.begin(); it != forward_tasks.end(); ) {
+                if (it->msg_id == msg_id) {
+                    printf("收到文件结束ACK，清理转发任务: msg_id=%u, chunk=%u, type=%d\n",
+                        it->msg_id, it->chunk_index, it->msg_type);
+                    it = forward_tasks.erase(it);
+                }
+                else {
+                    ++it;
+                }
+            }
+            pthread_mutex_unlock(&file_mutex);
+            pthread_mutex_unlock(&forward_mutex);
         }
         else {
-            ++it;
+            pthread_mutex_unlock(&file_mutex);
+            // 文件传输未完成，只清理特定的ACK任务
+            for (auto it = forward_tasks.begin(); it != forward_tasks.end(); ) {
+                if (it->client_fd == client_fd && it->msg_id == msg_id && it->chunk_index == chunk_index) {
+                    it = forward_tasks.erase(it);
+                }
+                else {
+                    ++it;
+                }
+            }
+            pthread_mutex_unlock(&forward_mutex);
         }
     }
-    pthread_mutex_unlock(&forward_mutex);
+    else {
+        // 普通ACK，只清理特定的任务
+        for (auto it = forward_tasks.begin(); it != forward_tasks.end(); ) {
+            if (it->client_fd == client_fd && it->msg_id == msg_id && it->chunk_index == chunk_index) {
+                it = forward_tasks.erase(it);
+            }
+            else {
+                ++it;
+            }
+        }
+        pthread_mutex_unlock(&forward_mutex);
+    }
+
     // 查找client_id
     int client_id = -1;
     for (int i = 0; i < MAX_CLIENTS; i++) {
@@ -764,6 +837,45 @@ void init_db_tables(MYSQL* conn) {
     mysql_query(conn, create_clients);
     mysql_query(conn, create_messages);
     mysql_query(conn, create_deliveries);
+}
+
+// 修改 handle_refuse_message，收到refuse后彻底清理所有相关任务，防止重传
+void handle_refuse_message(MYSQL* conn, Client clients[], int client_fd, PacketHeader header) {
+    uint32_t msg_id = ntohl(header.msg_id);
+    printf("收到客户端拒绝消息: msg_id=%u, fd=%d\n", msg_id, client_fd);
+    // CRC32校验
+    uint32_t crc_recv = ntohl(header.crc32);
+    uint32_t crc_calc = calculateHeaderCRC32(&header, NULL, 0);
+    int ok = (crc_recv == crc_calc);
+    print_crc32_check("REFUSE", msg_id, crc_recv, crc_calc, 0, 0, ok);
+    if (!ok) {
+        fprintf(stderr, "CRC32校验失败，丢弃拒绝包\n");
+        return;
+    }
+    // 清理转发任务
+    pthread_mutex_lock(&forward_mutex);
+    for (auto it = forward_tasks.begin(); it != forward_tasks.end(); ) {
+        if (it->msg_id == msg_id && it->client_fd == client_fd) {
+            printf("清理被拒绝的转发任务: msg_id=%u, chunk=%u, type=%d, fd=%d\n",
+                it->msg_id, it->chunk_index, it->msg_type, it->client_fd);
+            it = forward_tasks.erase(it);
+        }
+        else {
+            ++it;
+        }
+    }
+    pthread_mutex_unlock(&forward_mutex);
+    // 清理文件传输状态（如果存在）
+    pthread_mutex_lock(&file_mutex);
+    auto file_it = file_transfers.find(msg_id);
+    if (file_it != file_transfers.end()) {
+        printf("清理被拒绝的文件传输: msg_id=%u, filename=%s\n",
+            msg_id, file_it->second.filename);
+        file_transfers.erase(file_it);
+    }
+    pthread_mutex_unlock(&file_mutex);
+    // 发送ACK确认收到拒绝消息
+    send_ack(client_fd, msg_id, 0);
 }
 
 // 主函数
@@ -1022,6 +1134,9 @@ int main() {
                     break;
                 case MSG_TYPE_ACK:
                     handle_ack_message(conn, clients, fd, header);
+                    break;
+                case MSG_TYPE_REFUSE:
+                    handle_refuse_message(conn, clients, fd, header);
                     break;
                 default:
                     fprintf(stderr, "未知消息类型: %d\n", header.msg_type);
