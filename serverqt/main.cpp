@@ -300,7 +300,7 @@ void reliable_forward(int client_fd, const PacketHeader& header, const void* dat
     forward_tasks.push_back(task);
     pthread_mutex_unlock(&forward_mutex);
 
-    // 检查header写入
+    // 检查header写入完整性
     ssize_t headerWritten = send(client_fd, &header, sizeof(header), MSG_NOSIGNAL);
     if (headerWritten == -1) {
         const char* type_str = (header.msg_type == MSG_TYPE_TEXT) ? "文本" :
@@ -317,9 +317,10 @@ void reliable_forward(int client_fd, const PacketHeader& header, const void* dat
         fprintf(stderr, "[reliable_forward] %s协议头写入不完整: 已发送%zd字节/应发送%zu字节 (fd=%d, msg_id=%u)\n",
             type_str, headerWritten, sizeof(header), client_fd, task.msg_id);
         // 写入不完整，依赖重传机制处理
+        return;
     }
 
-    // 检查data写入
+    // 检查data写入完整性
     if (len > 0 && data) {
         ssize_t dataWritten = send(client_fd, data, len, MSG_NOSIGNAL);
         if (dataWritten == -1) {
@@ -337,6 +338,7 @@ void reliable_forward(int client_fd, const PacketHeader& header, const void* dat
             fprintf(stderr, "[reliable_forward] %s数据写入不完整: 已发送%zd字节/应发送%zu字节 (fd=%d, msg_id=%u)\n",
                 type_str, dataWritten, len, client_fd, task.msg_id);
             // 写入不完整，依赖重传机制处理
+            return;
         }
     }
 
@@ -349,17 +351,26 @@ void reliable_forward(int client_fd, const PacketHeader& header, const void* dat
 void check_forward_timeouts() {
     time_t now = time(NULL);
     pthread_mutex_lock(&forward_mutex);
-    for (auto it = forward_tasks.begin(); it != forward_tasks.end(); ) {
+
+    // 流量控制：每次最多处理10个重传任务，避免阻塞
+    const int MAX_PROCESS_PER_CYCLE = 10;
+    int processed_count = 0;
+
+    for (auto it = forward_tasks.begin();
+        it != forward_tasks.end() && processed_count < MAX_PROCESS_PER_CYCLE; ) {
+
         if (now - it->last_send_time >= FORWARD_TIMEOUT) {
             if (it->retry_count >= FORWARD_RETRY_LIMIT) {
                 const char* type_str = (it->msg_type == MSG_TYPE_TEXT) ? "文本" :
                     (it->msg_type == MSG_TYPE_FILE_START) ? "文件名" :
                     (it->msg_type == MSG_TYPE_FILE_CHUNK) ? "文件块" : "其他";
-                printf("[重传超限] 类型:%s msg_id=%u, chunk=%u, fd=%d\n", type_str, it->msg_id, it->chunk_index, it->client_fd);
+                printf("[重传超限] 类型:%s msg_id=%u, chunk=%u, fd=%d\n",
+                    type_str, it->msg_id, it->chunk_index, it->client_fd);
                 it = forward_tasks.erase(it);
                 continue;
             }
-            // 重发
+
+            // 重发header
             ssize_t headerWritten = send(it->client_fd, &it->header, sizeof(it->header), MSG_NOSIGNAL);
             if (headerWritten == -1) {
                 const char* type_str = (it->msg_type == MSG_TYPE_TEXT) ? "文本" :
@@ -370,6 +381,7 @@ void check_forward_timeouts() {
                 it->retry_count++;
                 it->last_send_time = now;
                 ++it;
+                processed_count++;
                 continue;
             }
             else if (headerWritten != sizeof(it->header)) {
@@ -378,8 +390,15 @@ void check_forward_timeouts() {
                     (it->msg_type == MSG_TYPE_FILE_CHUNK) ? "文件块" : "其他";
                 fprintf(stderr, "[重传] %s协议头写入不完整: 已发送%zd字节/应发送%zu字节 (fd=%d, msg_id=%u, 第%d次)\n",
                     type_str, headerWritten, sizeof(it->header), it->client_fd, it->msg_id, it->retry_count);
+                // 写入不完整，增加重试次数
+                it->retry_count++;
+                it->last_send_time = now;
+                ++it;
+                processed_count++;
+                continue;
             }
 
+            // 重发payload数据
             ssize_t dataWritten = 0;
             if (!it->payload.empty()) {
                 dataWritten = send(it->client_fd, it->payload.data(), it->payload.size(), MSG_NOSIGNAL);
@@ -392,6 +411,7 @@ void check_forward_timeouts() {
                     it->retry_count++;
                     it->last_send_time = now;
                     ++it;
+                    processed_count++;
                     continue;
                 }
                 else if (dataWritten != (ssize_t)it->payload.size()) {
@@ -400,10 +420,25 @@ void check_forward_timeouts() {
                         (it->msg_type == MSG_TYPE_FILE_CHUNK) ? "文件块" : "其他";
                     fprintf(stderr, "[重传] %s数据写入不完整: 已发送%zd字节/应发送%zu字节 (fd=%d, msg_id=%u, 第%d次)\n",
                         type_str, dataWritten, it->payload.size(), it->client_fd, it->msg_id, it->retry_count);
+                    // 写入不完整，增加重试次数
+                    it->retry_count++;
+                    it->last_send_time = now;
+                    ++it;
+                    processed_count++;
+                    continue;
                 }
             }
+
+            // 重传成功，更新发送时间
+            it->last_send_time = now;
+            const char* type_str = (it->msg_type == MSG_TYPE_TEXT) ? "文本" :
+                (it->msg_type == MSG_TYPE_FILE_START) ? "文件名" :
+                (it->msg_type == MSG_TYPE_FILE_CHUNK) ? "文件块" : "其他";
+            printf("[重传成功] 类型:%s msg_id=%u, chunk=%u, fd=%d, 第%d次重试\n",
+                type_str, it->msg_id, it->chunk_index, it->client_fd, it->retry_count);
         }
         ++it;
+        processed_count++;
     }
     pthread_mutex_unlock(&forward_mutex);
 }
@@ -457,19 +492,23 @@ void handle_text_message(MYSQL* conn, Client clients[], int client_fd, PacketHea
     }
     ssize_t bytes_read = recv(client_fd, buffer, ntohl(header.datalen), MSG_WAITALL);
     if (bytes_read != ntohl(header.datalen)) {
-        fprintf(stderr, "文本消息接收不完整\n");
+        fprintf(stderr, "文本消息接收不完整: 期望%d字节, 实际接收%zd字节\n",
+            ntohl(header.datalen), bytes_read);
         return;
     }
     buffer[bytes_read] = '\0';
+
     // CRC32校验
     uint32_t crc_recv = ntohl(header.crc32);
     uint32_t crc_calc = calculateHeaderCRC32(&header, buffer, bytes_read);
     int ok = (crc_recv == crc_calc);
     print_crc32_check("TEXT", ntohl(header.msg_id), crc_recv, crc_calc, 0, 1, ok);
     if (!ok) {
-        fprintf(stderr, "CRC32校验失败，丢弃消息\n");
+        fprintf(stderr, "CRC32校验失败，丢弃文本消息: msg_id=%u, 期望CRC32=0x%08x, 计算CRC32=0x%08x\n",
+            ntohl(header.msg_id), crc_recv, crc_calc);
         return;
     }
+
     printf("收到文本消息: %s\n", buffer);
     // 插入messages表
     char sql[1024];
@@ -588,9 +627,10 @@ void handle_file_chunk(MYSQL* conn, Client clients[], int client_fd, PacketHeade
     }
     if (total_read != datalen) {
         pthread_mutex_unlock(&file_mutex);
-        fprintf(stderr, "文件分片接收不完整: 期望%d, 实际%zu\n", datalen, total_read);
+        fprintf(stderr, "文件分片接收不完整: 期望%d字节, 实际接收%zu字节\n", datalen, total_read);
         return;
     }
+
     // CRC32校验
     uint32_t crc_recv = ntohl(header.crc32);
     uint32_t crc_calc = calculateHeaderCRC32(&header, buffer, total_read);
@@ -598,9 +638,11 @@ void handle_file_chunk(MYSQL* conn, Client clients[], int client_fd, PacketHeade
     print_crc32_check("FILE_CHUNK", msg_id, crc_recv, crc_calc, chunk_index, chunk_count, ok);
     if (!ok) {
         pthread_mutex_unlock(&file_mutex);
-        fprintf(stderr, "CRC32校验失败，丢弃文件分片\n");
+        fprintf(stderr, "CRC32校验失败，丢弃文件分片: msg_id=%u, chunk=%u/%u, 期望CRC32=0x%08x, 计算CRC32=0x%08x\n",
+            msg_id, chunk_index, chunk_count, crc_recv, crc_calc);
         return;
     }
+
     transfer.received_chunks[chunk_index] = true;
     transfer.received_size += total_read;
     pthread_mutex_unlock(&file_mutex);
